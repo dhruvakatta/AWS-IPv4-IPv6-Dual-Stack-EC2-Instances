@@ -1,0 +1,37 @@
+#! /bin/sh
+
+set -eu
+
+export VPCID="$(aws ec2 create-vpc --cidr-block 10.10.0.0/24 --amazon-provided-ipv6-cidr-block | jq -r '.Vpc.VpcId')"
+aws ec2 create-tags --tags Key=Name,Value=dualstack --resources "${VPCID}"
+aws ec2 modify-vpc-attribute --enable-dns-hostnames --vpc-id "${VPCID}"
+aws ec2 modify-vpc-attribute --enable-dns-support --vpc-id "${VPCID}"
+
+export IGW="$(aws ec2 create-internet-gateway | jq -r '.InternetGateway.InternetGatewayId')"
+aws ec2 create-tags --tags Key=Name,Value=dualstack --resources "${IGW}"
+aws ec2 attach-internet-gateway --vpc-id "${VPCID}" \
+        --internet-gateway-id "${IGW}"
+
+export V6CIDR=$(aws ec2 describe-vpcs --vpc-id "${VPCID}" | \
+        jq -r '.Vpcs[].Ipv6CidrBlockAssociationSet[].Ipv6CidrBlock')
+export SUBNET="$(aws ec2 create-subnet --cidr-block 10.10.0.0/26 \
+        --ipv6-cidr-block ${V6CIDR%/56}/64 \
+        --vpc-id "${VPCID}" | jq -r '.Subnet.SubnetId')"
+aws ec2 create-tags --tags Key=Name,Value=dualstack --resources "${SUBNET}"
+aws ec2 modify-subnet-attribute --subnet-id "${SUBNET}" --assign-ipv6-address-on-creation
+aws ec2 modify-subnet-attribute --subnet-id "${SUBNET}" --map-public-ip-on-launch
+
+export RTB="$(aws ec2 create-route-table --vpc-id "${VPCID}" | \
+        jq -r '.RouteTable.RouteTableId')"
+aws ec2 create-tags --tags Key=Name,Value=dualstack --resources "${RTB}"
+aws ec2 associate-route-table --route-table-id "${RTB}" \
+        --subnet-id "${SUBNET}" >/dev/null
+aws ec2 create-route --route-table-id "${RTB}" --destination-ipv6-cidr-block ::/0 --gateway-id "${IGW}" >/dev/null
+aws ec2 create-route --route-table-id "${RTB}" --destination-cidr-block 0.0.0.0/0 --gateway-id "${IGW}" >/dev/null
+
+export SG="$(aws ec2 create-security-group --description "Default security group for dualstack instances" \
+        --group-name "dualstack" \
+        --vpc-id "${VPCID}" | jq -r '.GroupId')"
+aws ec2 create-tags --tags Key=Name,Value=dualstack --resources "${SG}"
+aws ec2 authorize-security-group-ingress --group-id "${SG}" \
+        --ip-permissions '[{"IpProtocol": "-1", "IpRanges" : [{"CidrIp": "0.0.0.0/0"}], "Ipv6Ranges" : [{"CidrIpv6": "::/0"}]}]'
